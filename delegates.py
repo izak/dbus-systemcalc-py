@@ -834,3 +834,128 @@ class LgCircuitBreakerDetect(SystemCalcDelegate):
 				self._dbusmonitor.set_value(vebus_path, '/Mode', 4)
 			except dbus.exceptions.DBusException:
 				logging.error('Cannot switch off vebus device')
+
+class SystemState(SystemCalcDelegate):
+	""" Calculates the system state. If ESS is installed, show that state,
+		otherwise return the VEBus state. """
+
+	# vebus states are passed right through, and range from 0x00 (Off) to 0x0b (psu). Let's start ESS
+	# states at 0x20.
+	UNKNOWN = 0x00
+	DISCHARGING = 0x20
+	SUSTAIN = 0x21
+
+	def __init__(self):
+		super(SystemState, self).__init__()
+		self.can_bms = None
+
+	def get_input(self):
+		return [
+			('com.victronenergy.battery', [
+				'/Info/MaxDischargeCurrent',
+				'/Info/MaxChargeCurrent']),
+			('com.victronenergy.settings', [
+				'/Settings/CGwacs/BatteryLife/State']),
+			('com.victronenergy.vebus', [
+				'/Hub4/AssistantId',
+				'/Hub4/Sustain',
+				'/State',
+				'/VebusMainState',
+				'/Bms/AllowToDischarge',
+				'/Bms/AllowToCharge'])]
+
+	def get_output(self):
+		return [
+			('/SystemState/State', {'gettext': '%s'}),
+			('/SystemState/LowSoc', {'gettext': '%s'}),
+			('/SystemState/BatteryLife', {'gettext': '%s'}),
+			('/SystemState/DischargeDisabled', {'gettext': '%s'}),
+			('/SystemState/ChargeDisabled', {'gettext': '%s'}),
+			('/SystemState/SlowCharge', {'gettext': '%s'}),
+			('/SystemState/UserLimited', {'gettext': '%s'}),
+		]
+
+	def device_added(self, service, instance, do_service_change=True):
+		""" Keep track of things that have a canbus BMS. """
+		service_type = service.split('.')[2]
+		if service_type == 'battery':
+			if self._dbusmonitor.get_value(service,
+					'/Info/MaxDischargeCurrent') is not None:
+				self.can_bms = str(service)
+
+	def bms_state(self, vebus, can_bms):
+		# Will return None if no vebus BMS
+		may_discharge = self._dbusmonitor.get_value(vebus,
+			'/Bms/AllowToDischarge')
+		may_charge = self._dbusmonitor.get_value(vebus,
+			'/Bms/AllowToCharge')
+
+		if (may_discharge is None or may_charge is None) and can_bms is not None:
+			may_discharge = (self._dbusmonitor.get_value(can_bms,
+				'/Info/MaxDischargeCurrent', 0) != 0)
+			may_charge = (self._dbusmonitor.get_value(can_bms,
+				'/Info/MaxChargeCurrent', 0) != 0)
+			return (may_charge, may_discharge)
+
+		# No BMS involved, assume charge and discharge allowed
+		return (True, True)
+
+	def state(self, newvalues):
+		vebus = newvalues.get('/VebusService')
+		flags = sc_utils.SmartDict(dict.fromkeys(['LowSoc', 'BatteryLife',
+		'DischargeDisabled', 'ChargeDisabled', 'SlowCharge', 'UserLimited'], 0))
+
+		if vebus is None:
+			# This could be because a VEBUS BMS turned the inverter off.
+			# Unfortunately we will never know. Just admit we don't know.
+			return (SystemState.UNKNOWN, flags)
+
+		# VEBUS is available
+		ss = self._dbusmonitor.get_value(vebus, '/State')
+		assistant_id  = self._dbusmonitor.get_value(vebus, '/Hub4/AssistantId')
+		if assistant_id is None:
+			# ESS not installed. Return vebus state
+			return (ss, flags)
+
+		# VEBUS is available and ESS is installed
+		mainstate = self._dbusmonitor.get_value(vebus, '/VebusMainState')
+
+		# Charge or bypass mode.
+		if mainstate in (8, 9):
+			# BMS state
+			flags.ChargeDisabled, flags.DischargeDisabled = map(
+				lambda x: int(not x), self.bms_state(vebus, self.can_bms))
+
+			# User limit
+			user_discharge_limit = self._dbusmonitor.get_value(
+				'com.victronenergy.settings',
+				'/Settings/CGwacs/MaxDischargePower')
+			user_charge_limit = self._dbusmonitor.get_value(
+				'com.victronenergy.settings',
+				'/Settings/CGwacs/MaxChargePower')
+			flags.UserLimited = int(
+				user_discharge_limit == 0 or user_charge_limit == 0)
+
+			# ESS state
+			hubstate = self._dbusmonitor.get_value('com.victronenergy.settings',
+				'/Settings/CGwacs/BatteryLife/State')
+			if hubstate in (2, 3, 4, 10):
+				if newvalues.get('/Dc/Battery/Power') < -30:
+					ss = SystemState.DISCHARGING
+
+			if hubstate in (5, 11):
+				flags.LowSoc = 1
+				flags.BatteryLife = int(hubstate == 5)
+
+			if hubstate in (6, 12):
+				flags.SlowCharge = 1
+
+			# Sustain flag
+			if self._dbusmonitor.get_value(vebus, '/Hub4/Sustain'):
+				ss = SystemState.SUSTAIN
+
+		return (ss, flags)
+
+	def update_values(self, newvalues):
+		newvalues['/SystemState/State'], flags = self.state(newvalues)
+		#newvalues.update({'/SystemState/' + k: v for k, v in flags.items()})
